@@ -22,8 +22,8 @@
 #define ERROR_NO_EXIT(...) error_at_line(0, errno, __FILE__, __LINE__, __VA_ARGS__)
 
 #define PROXY_LISTEN_PORT 3344
-#define LINODE_IP "139.162.54.123"
-#define LINODE_PORT 22
+#define LINODE_IP "139.162.54.123" // actual server ip
+#define LINODE_PORT 22 // actual server port
 
 #define BACKLOG 7
 #define TRUE 1
@@ -48,8 +48,8 @@ void sigpipe_handler(int signal) {
 
 struct fd_context {
     int fd;
-    int events;
     int pair_fd;
+    int events;
     int direction;
     int closed;
     int ready;
@@ -77,8 +77,8 @@ int main() {
         ERROR_EXIT("fail to create listen fd");
     }
 
-    int o = 1;
-    if ( setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &o, sizeof(o)) == -1 ) {
+    int reuseraddr_flag = 1;
+    if ( setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseraddr_flag, sizeof(reuseraddr_flag)) == -1 ) {
         ERROR_EXIT("fail to set listen_fd SO_REUSEADDR");
     }
 
@@ -106,9 +106,9 @@ int main() {
     if ( epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &lev) == -1 ) {
         ERROR_EXIT("fail to add listen_fd to epoll");
     }
-    int current_fd_count = 1; // only listen fd is waited
+    int current_fd_count = 1; // current only listen fd is waited
 
-    // preparing
+    // preparing actual server addr struct
     struct sockaddr_in remote_addr;
     remote_addr.sin_family = AF_INET;
     remote_addr.sin_port = htons(LINODE_PORT);
@@ -123,7 +123,7 @@ int main() {
     std::map<int, struct fd_context *> fd_contexts;
 
     while (TRUE) {
-        ready_count = epoll_wait(epoll_fd, events, current_fd_count, -1/*timeout*/); // 100 means 100 milliseconds
+        ready_count = epoll_wait(epoll_fd, events, current_fd_count, 1000/*timeout*/); // 1000 means 1000 milliseconds
         if (ready_count == -1) {
             if (errno != EINTR) {
                 ERROR_EXIT("epoll_wait error");
@@ -134,7 +134,7 @@ int main() {
         }
 
         if (ready_count == 0) {
-            std::cout << "no fd ready, continue" << std::endl;
+            std::cout << "no fd ready in last period" << std::endl;
             continue;
         }
 
@@ -150,7 +150,7 @@ int main() {
                         ERROR_EXIT("fail to get listen_fd error flag");
                     }
                     // print error message and exit 
-                    std::cerr << strerror(error_code) << std::endl;
+                    std::cerr << "listen fd error: " << strerror(error_code) << std::endl;
                     exit(ERROR_EXIT_NO);
                 } 
 
@@ -168,6 +168,12 @@ int main() {
                         }
                     }
 
+                    if ( (current_fd_count>>1) >= MAX_CONCURRENT_CONNECTION) {
+                        std::cerr << "will overflow max concurrent connection, skip accept" << std::endl;
+                        close(fd); // we should accept and close, otherwise listen_fd is always EPOLLIN
+                        continue;
+                    }
+
                     char addr[INET6_ADDRSTRLEN] = {0};
                     std::cout << "incoming connect";
                     std::cout << ", client addr: " << inet_ntop(
@@ -178,7 +184,7 @@ int main() {
                     struct fd_context *in_context = new(struct fd_context);
                     memset(in_context, 0x0, sizeof(struct fd_context));
                     in_context->fd = fd;
-                    in_context->events = EPOLLIN | EPOLLOUT;
+                    in_context->events = EPOLLIN | EPOLLOUT; // EPOLLOUT should be optimized
                     in_context->direction = DIRT_INCOMING;
                     in_context->ready = TRUE;
                     in_context->client_addr = client_addr;
@@ -212,11 +218,11 @@ int main() {
                     struct fd_context *out_context = new(struct fd_context);
                     memset(out_context, 0x0, sizeof(struct fd_context));
                     out_context->fd = ofd;
-                    out_context->events = EPOLLIN | EPOLLOUT;
                     out_context->pair_fd = fd;
+                    out_context->events = EPOLLIN | EPOLLOUT; // EPOLLOUT should be optimized
                     in_context->pair_fd = ofd; // update pairing element
                     out_context->direction = DIRT_OUTGOING;
-                    out_context->ready = FALSE;
+                    out_context->ready = FALSE; // connecting, not ready
                     fd_contexts[ofd] = out_context;
 
                     struct epoll_event oev;
@@ -280,7 +286,7 @@ int main() {
 
                 if ( (event.events & EPOLLIN) != 0 ) { // read into content
                     while (TRUE) {
-                        if (context->content == NULL) {
+                        if (context->content == NULL) { // init buff, should be optimized
                             context->content = (char *)malloc(INIT_CAPACITY);
                             context->capacity = INIT_CAPACITY;
                             context->length = 0;
@@ -358,9 +364,9 @@ int main() {
 
                         } else {
                             int capacity = pair_context->capacity;
-                            for (; (capacity>>1) >= remaining; capacity>>1) { }
+                            for (; (capacity>>1) >= remaining; capacity = capacity>>1) { }
                             if (capacity == pair_context->capacity) {
-                                // no change
+                                // buff size no change
                             } else {
                                 char *tmp = pair_context->content;
                                 pair_context->capacity = capacity;
@@ -373,7 +379,7 @@ int main() {
                     }
 
                     if (pair_context->length == 0 && pair_context->closed == TRUE) {
-                        std::cerr << "gonna close current fd: " << context->fd << std::endl;
+                        std::cerr << "gonna close write of current fd: " << context->fd << std::endl;
                         if (shutdown(context->fd, SHUT_WR) == -1) {
                             ERROR_NO_EXIT("fail to shutdown fd write");
                         }
@@ -398,16 +404,9 @@ int main() {
                     (it->second)->length == 0 && pair_context->length == 0) {
                 to_remove_fd_sets.insert(it->first);
             }
-
-            /*
-            if ((it->second)->events == 0) {
-                std::cout << "fd events is empyt, set to close, fd: " << (it->second)->fd << std::endl;
-                to_remove_fd_sets.insert(it->first);
-            }
-            */
         }
 
-        for (std::set<int>::iterator it = to_remove_fd_sets.begin(); it != to_remove_fd_sets.end(); it ++) {
+        for (std::set<int>::iterator it = to_remove_fd_sets.begin(); it != to_remove_fd_sets.end(); it ++) { // actual delete
             if ( fd_contexts.find(*it) != fd_contexts.end() ) {
                 struct fd_context *context = fd_contexts[*it];
                 if ( epoll_ctl(epoll_fd, EPOLL_CTL_DEL, context->fd, NULL) == -1 ) {
