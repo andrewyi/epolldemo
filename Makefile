@@ -8,6 +8,6 @@ test: event_test.cpp
 	g++ event_test.cpp -ggdb -o $(TEST_EXECUTABLE)
 
 clean:
-	rm $(EXECUTABLE) $(TEST_EXECUTABLE)
+	rm -f $(EXECUTABLE) $(TEST_EXECUTABLE)
 
 .PHONY: all clean test

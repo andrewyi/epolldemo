@@ -22,8 +22,6 @@
 #define ERROR_NO_EXIT(...) error_at_line(0, errno, __FILE__, __LINE__, __VA_ARGS__)
 
 #define PROXY_LISTEN_PORT 3344
-#define LINODE_IP "139.162.54.123"
-#define LINODE_PORT 22
 
 #define BACKLOG 7
 #define TRUE 1
@@ -31,21 +29,8 @@
 
 #define INIT_CAPACITY 1024
 char tmp_content[INIT_CAPACITY];
-// #define SHRINK_RATIO 2
 
-#define DIRT_INCOMING 1
-#define DIRT_OUTGOING 2
-
-const int MAX_CONCURRENT_CONNECTION = 3;
-const int MAX_FD_COUNT = MAX_CONCURRENT_CONNECTION*2 + 1;
-
-void sigpipe_handler(int signal) {
-    if (signal == SIGPIPE) {
-        std::cerr << "sigpipe received" << std::endl;
-    } else {
-        std::cerr << "singal received, num: " << signal << std::endl;
-    }
-}
+const int MAX_FD_COUNT = 7;
 
 struct fd_context {
     int fd;
@@ -53,17 +38,9 @@ struct fd_context {
 };
 
 int main() {
-    struct sigaction act;
-    act.sa_handler = sigpipe_handler; // also can be SIG_IGN
-    if ( sigaction(SIGPIPE, &act, NULL) == -1 ) {
-        ERROR_EXIT("fail to set sigpipe handler");
-    }
-    // alternative way to ignore SIGPIPE
-    /*
     if ( signal(SIGPIPE, SIG_IGN) == SIG_ERR ) {
         ERROR_EXIT("fail to ignore signal pipe");
     }
-    */
 
     int listen_fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0);
     if (listen_fd == -1) {
@@ -112,7 +89,8 @@ int main() {
     std::map<int, struct fd_context *> fd_contexts;
 
     while (TRUE) {
-        ready_count = epoll_wait(epoll_fd, events, current_fd_count, 5000/*timeout*/); // 100 means 100 milliseconds
+        std::cout << "gonna epoll_wait" << std::endl;
+        ready_count = epoll_wait(epoll_fd, events, current_fd_count, -1/*timeout*/); // 100 means 100 milliseconds
         if (ready_count == -1) {
             if (errno != EINTR) {
                 ERROR_EXIT("epoll_wait error");
@@ -127,6 +105,7 @@ int main() {
             continue;
         }
 
+        std::set<int> to_remove_fd_sets;
         for (int j=0; j!=ready_count; j++) {
             struct epoll_event event = events[j];
 
@@ -149,11 +128,16 @@ int main() {
                     int fd = accept4(listen_fd, (struct sockaddr *)&client_addr, &addr_len, SOCK_NONBLOCK);
                     if (fd == -1) {
                         if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                            ERROR_NO_EXIT("accept would block, stop accepting");
                             break;
                         } else {
                             ERROR_EXIT("fail to accept4");
                         }
+                    }
+
+                    if ( current_fd_count >= MAX_FD_COUNT) {
+                        std::cerr << "will overflow max concurrent connection, skip accept" << std::endl;
+                        close(fd); // we should accept and close, otherwise listen_fd is always EPOLLIN
+                        continue;
                     }
 
                     struct fd_context *in_context = new(struct fd_context);
@@ -163,7 +147,7 @@ int main() {
                     fd_contexts[fd] = in_context;
 
                     struct epoll_event iev;
-                    iev.events = EPOLLIN; // we do not need to write
+                    iev.events = EPOLLIN | EPOLLET; // we do not need to write
                     iev.data.fd = fd;
                     if ( epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &iev) == -1 ) {
                         ERROR_EXIT("fail to add incoming fd to epoll");
@@ -193,26 +177,15 @@ int main() {
                             ERROR_EXIT("fail to get fd error flag");
                         }
                         // print error message and exit 
-                        std::cerr << strerror(error_code) << std::endl;
+                        std::cerr << "fd epollerr: " << strerror(error_code) << ", fd: " << fd << std::endl;
                     } 
 
                     if ( (event.events & EPOLLHUP) != 0 ) {
                         std::cerr << "fd hang up" << std::endl;
                     }
 
-                    if ( epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1 ) {
-                        ERROR_EXIT("fail to delete fd of epoll");
-                    } else {
-                        std::cerr << "delete from epoll, fd: " << fd << std::endl;
-                    }
-
-                    close(fd);
-                    fd_contexts.erase(fd);
-                    delete(context);
-                    current_fd_count -= 1;
-                    // continue; // continue with next epoll wait fd
+                    to_remove_fd_sets.insert(fd);
                 } 
-
 
                 if ( (event.events & EPOLLIN) != 0 ) { // read into content
                     std::cout << "data arrived from fd: " << fd << std::endl;
@@ -226,7 +199,8 @@ int main() {
                             } else if (errno == EINTR) {
                                 continue;
                             } else {
-                                ERROR_NO_EXIT("fail to read from fd"); // leave error to epoll_wait EPOLLERR
+                                ERROR_NO_EXIT("fail to read from fd");
+                                to_remove_fd_sets.insert(fd);
                                 break;
                             }
 
@@ -235,25 +209,35 @@ int main() {
 
                         } else if (byte_count == 0){
                             std::cout << "seems remote close write, fd: " << fd << std::endl;
-                            if ( epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1 ) {
-                                ERROR_EXIT("fail to delete fd of epoll");
-                            } else {
-                                std::cerr << "delete from epoll, fd: " << fd << std::endl;
-                            }
-
-                            close(fd);
-                            fd_contexts.erase(fd);
-                            delete(context);
-                            current_fd_count -= 1;
+                            to_remove_fd_sets.insert(fd);
                             break;
 
                         } else {
                             ERROR_EXIT("should never be here");
                         }
+
+                        sleep(3);
                     }
                 }
             }
         } // for loop with epoll events
+
+        for (std::set<int>::iterator it = to_remove_fd_sets.begin(); it != to_remove_fd_sets.end(); it ++) { // actual delete
+            std::cout << "remove fd: " << *it << std::endl;
+            if ( fd_contexts.find(*it) == fd_contexts.end() ) {
+                std::cerr << "fd not found in fd_contexts, fd: " << *it << std::endl;
+                exit(ERROR_EXIT_NO);
+            }
+
+            struct fd_context *context = fd_contexts[*it];
+            if ( epoll_ctl(epoll_fd, EPOLL_CTL_DEL, context->fd, NULL) == -1 ) {
+                ERROR_EXIT("fail to delete fd of epoll");
+            }
+            fd_contexts.erase(context->fd);
+            close(context->fd);
+            delete(context);
+            current_fd_count -= 1;
+        }
 
     } // while (TRUE)
 
